@@ -58,9 +58,14 @@ problem = NMPCProblem(
     path_constraints=path_constraints,
 )
 
-result = solve_slsqp_nmpc(problem, ftol=1e-9, maxiter=300)
+result = solve_slsqp_nmpc(problem, ftol=1e-9, maxiter=300, feasibility_tolerance=1e-9)
 print(result.success, result.x[:1], result.rollouts)
 ```
+
+`feasibility_tolerance` is an independent post-solve bound (default `1e-9`), separate
+from SciPy's `ftol`. A returned point whose independently measured path or box
+violation exceeds it has `success` withdrawn with status `101`, so solver success and
+feasibility are decided separately.
 
 `result` is a SciPy `OptimizeResult` with additional fields that are present on
 every return path:
@@ -74,6 +79,8 @@ every return path:
 | `nonfinite_blocks` | which arrays at the returned point were not finite |
 | `nonfinite_warning` | the warning text, also carried here so a strict warning filter cannot discard a solve |
 | `diagnostic_error` | why post-solve verification could not be completed, if it could not |
+| `feasibility_tolerance` | the independent post-solve feasibility bound applied to this solve |
+| `optimizer_fun` | the objective the optimizer reported, kept alongside the independently recomputed `fun` |
 
 ## Contract
 
@@ -91,11 +98,14 @@ opposed inequalities.
 
 Before reporting success the solver recomputes the returned point in full --
 controls, objective, gradient, trajectory, both dynamics Jacobians and, where
-present, path values and both Jacobians. A single non-finite entry withdraws
-`success` while every computed field is preserved. Checking only the constraint
-values would miss a non-finite final state on a problem without path
-constraints, where the constraint call returns an empty array without rolling
-the trajectory out at all.
+present, path values and both Jacobians. The objective is recomputed
+independently at the returned control and compared to the optimizer value, so a
+disagreeing result does not reach the caller as a success. A single non-finite
+entry withdraws `success` while every computed field is preserved. A path or box
+violation larger than `feasibility_tolerance` withdraws `success` with status
+`101`. Checking only the constraint values would miss a non-finite final state on
+a problem without path constraints, where the constraint call returns an empty
+array without rolling the trajectory out at all.
 
 ## Verification
 

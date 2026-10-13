@@ -14,12 +14,16 @@ import numpy as np
 from scipy.optimize import Bounds, OptimizeResult, minimize
 
 from nmpc_runtime import (
+    DEFAULT_FEASIBILITY_TOLERANCE,
+    DEFINITENESS_TOLERANCE,
+    INFEASIBLE_DIAGNOSTIC_STATUS,
     NONFINITE_DIAGNOSTIC_STATUS,
     SYMMETRY_TOLERANCE,
     bound_violation,
     finalize_result,
     readonly_view,
     resolve_start,
+    validate_feasibility_tolerance,
     validate_solver_options,
     violation_from_values,
 )
@@ -119,11 +123,19 @@ class NMPCProblem:
                 self, name, _immutable_array(0.5 * (matrix + matrix.T), name)
             )
 
+        # The eigenvalue floor scales with the spectrum, so a genuinely
+        # semidefinite weight is not rejected once it is large: a symmetric
+        # solve rounds at order ``eps * ||M||``, which an absolute floor would
+        # read as a negative eigenvalue (a rank-deficient Gram matrix at
+        # magnitude 1e6 returns about -6e-10).
         for name in ("state_weight", "terminal_weight"):
-            matrix = getattr(self, name)
-            if float(np.min(np.linalg.eigvalsh(matrix))) < -1e-12:
+            eigenvalues = np.linalg.eigvalsh(getattr(self, name))
+            scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+            if float(np.min(eigenvalues)) < -DEFINITENESS_TOLERANCE * scale:
                 raise ValueError(f"{name} must be positive semidefinite")
-        if float(np.min(np.linalg.eigvalsh(self.input_weight))) <= 0.0:
+        input_eigenvalues = np.linalg.eigvalsh(self.input_weight)
+        input_scale = max(1.0, float(np.max(np.abs(input_eigenvalues))))
+        if float(np.min(input_eigenvalues)) <= DEFINITENESS_TOLERANCE * input_scale:
             raise ValueError("input_weight must be positive definite")
 
     @property
@@ -402,6 +414,7 @@ def _attach_final_point_diagnostics(
     evaluator: _CondensedEvaluator,
     lower: Array,
     upper: Array,
+    feasibility_tolerance: float,
 ) -> None:
     """Re-establish finiteness and feasibility at the returned point.
 
@@ -417,15 +430,21 @@ def _attach_final_point_diagnostics(
 
     controls = np.asarray(result.x, dtype=float)
     blocks: list[tuple[str, Array]] = [("controls", controls)]
-    objective = result.get("fun", None)
-    if objective is not None:
-        blocks.append(("objective", np.asarray(objective, dtype=float)))
+    optimizer_objective = result.get("fun", None)
+    result.optimizer_fun = optimizer_objective
+    if optimizer_objective is not None:
+        blocks.append(
+            ("objective", np.asarray(optimizer_objective, dtype=float))
+        )
 
     violation = float("nan")
     diagnostic_error: str | None = None
     try:
         states, state_jacobians, input_jacobians = evaluator._rollout(controls)
+        objective = evaluator.objective(controls)
+        result.fun = objective
         blocks += [
+            ("recomputed objective", np.asarray(objective, dtype=float)),
             ("states", states),
             ("dynamics state Jacobians", state_jacobians),
             ("dynamics input Jacobians", input_jacobians),
@@ -442,6 +461,18 @@ def _attach_final_point_diagnostics(
                 ("path Jacobian", evaluator.inequality_jacobian(controls)),
             ]
             violation = violation_from_values(values)
+        if optimizer_objective is not None:
+            optimizer_value = float(np.asarray(optimizer_objective, dtype=float))
+            mismatch_tolerance = (
+                10.0
+                * np.finfo(float).eps
+                * max(1.0, abs(float(objective)), abs(optimizer_value))
+            )
+            if abs(float(objective) - optimizer_value) > mismatch_tolerance:
+                diagnostic_error = (
+                    "optimizer objective disagrees with the independently "
+                    f"recomputed value: {optimizer_value!r} versus {objective!r}"
+                )
     except (MemoryError, RecursionError):
         # Resource exhaustion is not a model defect and must not be recorded as
         # one, so it is re-raised rather than folded into a diagnostic string.
@@ -457,6 +488,7 @@ def _attach_final_point_diagnostics(
         evaluator.nonfinite_evaluations,
         evaluator.rollout_count,
         diagnostic_error,
+        feasibility_tolerance,
     )
 
 
@@ -466,10 +498,12 @@ def solve_slsqp_nmpc(
     *,
     ftol: float = 1e-9,
     maxiter: int = 600,
+    feasibility_tolerance: float = DEFAULT_FEASIBILITY_TOLERANCE,
 ) -> OptimizeResult:
     """Solve a condensed NMPC problem with exact-derivative SLSQP."""
 
     validate_solver_options(ftol, maxiter)
+    validate_feasibility_tolerance(feasibility_tolerance)
 
     evaluator = _CondensedEvaluator(problem)
     lower = np.tile(problem.input_lower, problem.horizon)
@@ -480,9 +514,26 @@ def solve_slsqp_nmpc(
 
     # A non-finite initial trajectory is a specification error.  Later trial
     # evaluations are returned to SLSQP so its line search can retreat.
-    evaluator._rollout(decision0)
-    if problem.path_constraints is not None:
-        evaluator._evaluate_path(decision0)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        evaluator._rollout(decision0)
+        initial_blocks: list[tuple[str, Array]] = [
+            ("initial objective", np.asarray(evaluator.objective(decision0))),
+            ("initial objective gradient", evaluator.objective_jacobian(decision0)),
+        ]
+        if problem.path_constraints is not None:
+            evaluator._evaluate_path(decision0)
+            initial_blocks.append(
+                ("initial path Jacobian", evaluator.inequality_jacobian(decision0))
+            )
+    initial_nonfinite = tuple(
+        name
+        for name, block in initial_blocks
+        if not np.all(np.isfinite(np.asarray(block, dtype=float)))
+    )
+    if initial_nonfinite:
+        raise ValueError(
+            "initial point produced non-finite " + ", ".join(initial_nonfinite)
+        )
     evaluator.allow_nonfinite_trials()
 
     bounds = Bounds(lower, upper)
@@ -510,11 +561,19 @@ def solve_slsqp_nmpc(
             constraints=constraints,
             options={"ftol": ftol, "maxiter": maxiter, "disp": False},
         )
-        _attach_final_point_diagnostics(result, problem, evaluator, lower, upper)
+        _attach_final_point_diagnostics(
+            result,
+            problem,
+            evaluator,
+            lower,
+            upper,
+            feasibility_tolerance,
+        )
     return result
 
 
 __all__ = [
+    "INFEASIBLE_DIAGNOSTIC_STATUS",
     "NONFINITE_DIAGNOSTIC_STATUS",
     "SYMMETRY_TOLERANCE",
     "NMPCProblem",

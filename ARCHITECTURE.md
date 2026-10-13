@@ -155,6 +155,14 @@ and, where path constraints are present, their values and both Jacobians. A
 single non-finite entry, or a diagnostic that cannot be completed, withdraws
 `success` while every computed field is preserved.
 
+The objective is recomputed independently at the returned control and compared
+to the value the optimizer reported, which is retained as `optimizer_fun`. A
+finite disagreement is recorded as a diagnostic error and withdraws `success`,
+so an internally inconsistent result does not reach the caller. Feasibility is
+decided separately from the optimizer status: a path or box violation larger
+than the solve's `feasibility_tolerance` (default `1e-9`, independent of `ftol`)
+withdraws `success` with status `101`.
+
 Checking only the constraint values is not enough, and that was a real defect:
 on a problem without path constraints the constraint call returns an empty
 array without rolling the trajectory out at all, so a non-finite final state
@@ -170,9 +178,9 @@ so the core can retreat. The count is on the result as
 model domain disagree and the returned point may not be optimal.
 
 The result carries `rollouts`, `max_constraint_violation`, `bound_violation`,
-`nonfinite_evaluations`, `nonfinite_blocks`, `nonfinite_warning` and
-`diagnostic_error` on every path, so the schema is fixed rather than
-conditional.
+`nonfinite_evaluations`, `nonfinite_blocks`, `nonfinite_warning`,
+`diagnostic_error`, `feasibility_tolerance` and `optimizer_fun` on every path, so
+the schema is fixed rather than conditional.
 
 ## Concurrency
 

@@ -30,10 +30,22 @@ Array = np.ndarray
 # Reported in ``result.status`` when a post-solve array is not finite.  The
 # compiled SLSQP core uses 0 through 9, so this value cannot collide with one.
 NONFINITE_DIAGNOSTIC_STATUS = 100
+INFEASIBLE_DIAGNOSTIC_STATUS = 101
 
 # Relative tolerance on weight-matrix asymmetry, applied as
 # ``atol = SYMMETRY_TOLERANCE * max(1, max|M|)``.
 SYMMETRY_TOLERANCE = 1e-10
+
+# Backward-error allowance for a symmetric eigenvalue solve.  This is a small
+# multiple of machine epsilon, not a modelling tolerance: a larger fixed
+# relative number would admit a genuinely negative mode in an ill-scaled
+# matrix and could reject a resolvable positive mode in the input weight.
+DEFINITENESS_TOLERANCE = 100.0 * np.finfo(float).eps
+
+# Independent feasibility contract for a returned control.  SLSQP's ``ftol``
+# also controls objective and step tests, so a large ``ftol`` is not a safe
+# substitute for an explicit feasibility decision.
+DEFAULT_FEASIBILITY_TOLERANCE = 1e-9
 
 
 def readonly_view(value: Array) -> Array:
@@ -87,6 +99,18 @@ def validate_solver_options(ftol: float, maxiter: int) -> None:
         or maxiter < 1
     ):
         raise ValueError("maxiter must be a positive integer")
+
+
+def validate_feasibility_tolerance(value: float) -> None:
+    """Require a nonnegative finite post-solve feasibility tolerance."""
+
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, (bool, np.bool_))
+        or not np.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError("feasibility_tolerance must be a nonnegative finite float")
 
 
 def resolve_start(
@@ -157,13 +181,17 @@ def emit_nonfinite_warning(count: int, rollouts: int) -> str:
     """
 
     message = (
-        f"{count} of {rollouts} rollouts produced non-finite values; the input "
+        f"{count} non-finite trajectory/path evaluations occurred across "
+        f"{rollouts} rollouts; the input "
         "bounds and the model domain may disagree, and the returned point may "
         "not be optimal"
     )
     try:
         warnings.warn(message, RuntimeWarning, stacklevel=3)
-    except Warning:
+    except Exception:
+        # A third-party ``warnings.showwarning`` hook may raise a non-Warning
+        # exception.  Reporting a diagnostic must never discard a completed
+        # optimization; the same text remains available on the result.
         pass
     return message
 
@@ -176,6 +204,7 @@ def finalize_result(
     nonfinite_evaluations: int,
     rollouts: int,
     diagnostic_error: str | None,
+    feasibility_tolerance: float = DEFAULT_FEASIBILITY_TOLERANCE,
 ) -> None:
     """Attach the verification fields and withdraw an unverifiable success.
 
@@ -192,6 +221,7 @@ def finalize_result(
     result.diagnostic_error = diagnostic_error
     result.nonfinite_blocks = unverified
     result.nonfinite_warning = None
+    result.feasibility_tolerance = feasibility_tolerance
 
     if unverified or diagnostic_error is not None:
         result.success = False
@@ -201,6 +231,19 @@ def finalize_result(
             if unverified
             else f"post-solve verification failed: {diagnostic_error}"
         )
+    elif (
+        not np.isfinite(violation)
+        or not np.isfinite(box_violation)
+        or violation > feasibility_tolerance
+        or box_violation > feasibility_tolerance
+    ):
+        result.success = False
+        result.status = INFEASIBLE_DIAGNOSTIC_STATUS
+        result.message = (
+            "returned point failed independent feasibility verification: "
+            f"path violation {violation:.3e}, box violation {box_violation:.3e}, "
+            f"tolerance {feasibility_tolerance:.3e}"
+        )
 
     if nonfinite_evaluations:
         result.nonfinite_warning = emit_nonfinite_warning(
@@ -209,6 +252,9 @@ def finalize_result(
 
 
 __all__ = [
+    "DEFAULT_FEASIBILITY_TOLERANCE",
+    "DEFINITENESS_TOLERANCE",
+    "INFEASIBLE_DIAGNOSTIC_STATUS",
     "NONFINITE_DIAGNOSTIC_STATUS",
     "SYMMETRY_TOLERANCE",
     "bound_violation",
@@ -218,5 +264,6 @@ __all__ = [
     "readonly_view",
     "resolve_start",
     "validate_solver_options",
+    "validate_feasibility_tolerance",
     "violation_from_values",
 ]
